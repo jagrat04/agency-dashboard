@@ -10,7 +10,10 @@ services:
     env: node
     plan: free
     healthCheckPath: /health
-    buildCommand: npm install && npm run prisma:generate --workspace server && npm run build:server
+    # --include=dev: Render sets NODE_ENV=production for the build shell regardless of
+    # what's declared below, which makes plain `npm install` silently skip devDependencies
+    # (typescript's @types/* packages, prisma CLI) — this flag overrides that.
+    buildCommand: npm install --include=dev && npm run prisma:generate --workspace server && npm run build:server
     startCommand: npm run prisma:migrate:deploy --workspace server && node server/dist/index.js
     envVars:
       - key: DATABASE_URL
