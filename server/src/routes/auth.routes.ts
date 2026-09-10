@@ -10,10 +10,15 @@ import { env } from "../config/env";
 const router = Router();
 
 const REFRESH_COOKIE = "refreshToken";
+const isProd = process.env.NODE_ENV === "production";
 const cookieOptions = {
   httpOnly: true,
-  secure: process.env.NODE_ENV === "production",
-  sameSite: "lax" as const,
+  secure: isProd,
+  // Frontend (Vercel) and backend (Render/Railway) are different domains in
+  // production, so the cookie needs SameSite=None to survive the cross-site
+  // request. Locally both run on localhost (different ports only, same site),
+  // where Lax already works and None would require secure:true over http.
+  sameSite: (isProd ? "none" : "lax") as "none" | "lax",
   path: "/api/auth",
   maxAge: env.refreshTokenTtlDays * 24 * 60 * 60 * 1000,
 };
