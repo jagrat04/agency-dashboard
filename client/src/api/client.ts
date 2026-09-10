@@ -25,9 +25,7 @@ interface RefreshResult {
   user: User;
 }
 
-let refreshPromise: Promise<RefreshResult | null> | null = null;
-
-async function refreshAccessToken(): Promise<RefreshResult | null> {
+async function performRefresh(): Promise<RefreshResult | null> {
   try {
     const res = await axios.post(`${API_URL}/api/auth/refresh`, {}, { withCredentials: true });
     setAccessToken(res.data.accessToken);
@@ -38,11 +36,19 @@ async function refreshAccessToken(): Promise<RefreshResult | null> {
   }
 }
 
-async function refreshAccessTokenOnly(): Promise<string | null> {
-  refreshPromise ??= refreshAccessToken().finally(() => {
+// Dedupe concurrent callers (e.g. React StrictMode's double-invoked effect, or
+// several requests 401ing at once) onto a single in-flight refresh.
+let refreshPromise: Promise<RefreshResult | null> | null = null;
+
+function refreshAccessToken(): Promise<RefreshResult | null> {
+  refreshPromise ??= performRefresh().finally(() => {
     refreshPromise = null;
   });
-  const result = await refreshPromise;
+  return refreshPromise;
+}
+
+async function refreshAccessTokenOnly(): Promise<string | null> {
+  const result = await refreshAccessToken();
   return result?.accessToken ?? null;
 }
 
