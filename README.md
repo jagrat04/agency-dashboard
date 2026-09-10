@@ -84,3 +84,4 @@ Everything seeded uses `password123` as the password:
 - The overdue check runs every minute in the same process as the API server. If the server's down, overdue flags just catch up on the next tick once it's back — nothing time-critical depends on the exact minute.
 - No attachments on tasks.
 - One Postgres instance, no replica. Not something this scale needs.
+- The hosted backend runs on Render's free tier, which spins down after ~15 minutes idle. The first request after that can take 30-60s while it wakes back up — a real user just sees a slow first load, not an error.
