@@ -1,77 +1,86 @@
 # Agency Dashboard
 
-Internal tool for a small agency to manage client projects, track tasks, and
-watch team activity in real time.
+Internal tool for a small agency to keep track of client projects, assign and
+follow up on tasks, and see what the team is doing in real time instead of
+pinging people on Slack to ask "hey is this done yet".
 
 ## Stack
 
-- **Frontend**: React + TypeScript (Vite)
-- **Backend**: Node.js + Express + TypeScript
-- **Database**: PostgreSQL via Prisma
-- **Real-time**: Socket.io
-- **Background jobs**: node-cron
-- **Auth**: JWT access token (in memory, client side) + refresh token (HttpOnly cookie)
+- Frontend: React + TypeScript, built with Vite
+- Backend: Node.js + Express + TypeScript
+- DB: PostgreSQL, using Prisma as the ORM
+- Real-time: Socket.io
+- Cron: node-cron for the overdue sweep
+- Auth: JWT access token kept in memory on the client, refresh token in an HttpOnly cookie
 
-## Local setup (Docker for Postgres)
+## Running it locally
+
+Postgres runs in Docker, everything else runs with plain npm.
 
 ```bash
-# 1. start Postgres
+# spin up postgres
 docker compose up -d
 
-# 2. install deps (root workspace covers both server and client)
+# install everything (root workspace covers server + client)
 npm install
 
-# 3. configure env
+# env files
 cp server/.env.example server/.env
 cp client/.env.example client/.env
 
-# 4. create schema + seed data
+# schema + seed data
 cd server
 npx prisma migrate dev --name init
 npm run seed
 cd ..
 
-# 5. run both apps
+# run both
 npm run dev:server   # http://localhost:4000
 npm run dev:client   # http://localhost:5173
 ```
 
-Seed accounts (password `password123` for all):
+Everything seeded uses `password123` as the password:
 
 | Role | Email |
 |---|---|
 | Admin | admin@agency.dev |
 | PM | pm1@agency.dev, pm2@agency.dev |
-| Developer | dev1@agency.dev .. dev4@agency.dev |
+| Developer | dev1@agency.dev through dev4@agency.dev |
 
-## Database schema
+## The schema, roughly
 
-- **User** — `id, name, email, passwordHash, role`. Indexed on `role` (role-scoped queries run on almost every request).
-- **RefreshToken** — one row per issued refresh token, so tokens can be individually revoked/rotated. Indexed on `userId`.
-- **Client** — the agency's clients. A `Project` belongs to one client.
-- **Project** — belongs to a `Client` and to a managing `User` (PM). Indexed on `managerId` (every PM-scoped query filters by it) and `clientId`.
-- **Task** — belongs to a `Project`, optionally assigned to a `User`. Carries `status`, `priority`, `dueDate`, `isOverdue`. Also has a separate `number` (auto-increment int) purely for human-friendly display ("Task #12") since the primary key is a cuid. Indexed on `projectId`, `assigneeId`, `status`, `priority`, `dueDate`, `isOverdue` — these are exactly the columns every list/filter/dashboard query touches.
-- **ActivityLog** — append-only audit trail: `projectId, taskId, actorId, action, fromValue, toValue, createdAt`. This is the source of truth for the activity feed — nothing about "who changed what" is derived or recomputed. Indexed on `(projectId, createdAt)` (the feed always queries "recent activity for this scope, newest first") and `taskId`.
-- **Notification** — `recipientId, type, message, taskId, isRead`. Indexed on `(recipientId, isRead)` (unread badge count) and `(recipientId, createdAt)` (dropdown list).
+**User** holds `role` (ADMIN/PM/DEVELOPER) and is indexed on that column since basically every query filters by it one way or another.
 
-## Architectural decisions
+**RefreshToken** is one row per issued token rather than one column on User, so a single session can be revoked/rotated without touching anything else. Indexed on `userId`.
 
-**Express over Fastify.** This is a CRUD-heavy internal tool with moderate traffic; Express's middleware ecosystem and familiarity outweigh Fastify's raw throughput advantage here.
+**Client** is just the agency's clients — a Project hangs off one of these.
 
-**Socket.io over raw WebSocket.** The spec needs rooms (per-project viewers, per-user, admin-wide), reconnection with backoff, and a fallback transport — all things Socket.io already handles correctly. Implementing reconnection/heartbeat logic by hand on top of `ws` would just reproduce a worse version of what Socket.io ships.
+**Project** belongs to a Client and to a PM (`managerId`). Indexed on `managerId` because "give me this PM's projects" is one of the most common queries in the app, and on `clientId`.
 
-**node-cron over Bull/BullMQ for the overdue job.** There's exactly one background job (sweep overdue tasks) with no retries, no queueing of arbitrary jobs, and no need for a second infrastructure dependency (Redis). Bull earns its keep when you have many job types, need retries/backoff, or want job persistence across restarts — none of which applies to a single `UPDATE ... WHERE dueDate < now()` running every minute.
+**Task** is the busiest table — belongs to a Project, optionally has an assignee, and carries `status`, `priority`, `dueDate`, `isOverdue`. I also gave it a plain auto-incrementing `number` field alongside the cuid primary key, purely so the activity feed can say "Task #12" instead of a 25-character id. It's indexed on `projectId`, `assigneeId`, `status`, `priority`, `dueDate`, and `isOverdue` — that's the full list of things the filter bar and dashboards query on, so I didn't want any of those falling back to a table scan.
 
-**Refresh token in an HttpOnly cookie, access token in memory.** The access token never touches `localStorage`, so it isn't reachable by an XSS payload; it lives only in a JS variable and is re-acquired via `/api/auth/refresh` on page load and on 401. The refresh token is HttpOnly + SameSite=Lax, scoped to `/api/auth`, and rotated on every use (old token deleted, new one issued) — reuse of a stale token fails closed.
+**ActivityLog** is append-only: project, task, who did it, what action, from/to values, when. This is the actual source of truth for the feed — nothing gets reconstructed after the fact from task history. Indexed on `(projectId, createdAt)` since "recent activity for this project, newest first" is the standard query shape, plus `taskId` for pulling a single task's history.
 
-**Role enforcement lives entirely on the server.** Every route runs `requireAuth` + `requireRole`, and list/detail endpoints additionally filter by ownership (`managerId`, `assigneeId`) in the Prisma query itself — a developer's JWT simply cannot retrieve another developer's task or another PM's project, regardless of what the frontend renders.
+**Notification** is recipient + type + message + read flag. Indexed on `(recipientId, isRead)` for the unread badge count and `(recipientId, createdAt)` for the dropdown list.
 
-**Real-time role-filtered feed.** On connect, a socket auto-joins `user:{id}` and, for admins, `role:admin`. Viewing a project additionally joins `project:{id}`. Every activity write emits to exactly the rooms that should see it: the project room, `role:admin`, the owning PM's room, and (if assigned) the developer's room. A client that reconnects after being offline calls `GET /api/activity` (role-scoped, `limit=20`, straight from Postgres — no in-memory cache) to backfill whatever it missed.
+## Why I picked what I picked
 
-## Known limitations
+**Express, not Fastify.** Nothing here is CPU-bound or needs Fastify's extra throughput — it's a fairly standard CRUD app with some websocket wiring on top, and Express's middleware ecosystem made that wiring easier.
 
-- No password reset / email flow — accounts are provisioned via the seed script only.
-- No pagination on task/activity lists beyond the fixed `take` limits; fine at agency scale, would need cursor pagination at real scale.
-- The overdue sweep runs every minute in-process; if the server is down for a stretch, overdue flags catch up on the next tick rather than the exact due instant.
-- No file attachments on tasks.
-- Single Postgres instance, no read replica — not a concern at this scale.
+**Socket.io, not a raw WebSocket.** The feed needs rooms — per project, per user, one for admins — plus reconnection handling and a polling fallback for anyone behind a flaky proxy. All of that is already built into Socket.io. Writing my own reconnect/heartbeat logic on top of the `ws` package would just mean rebuilding a worse version of something that already works.
+
+**node-cron, not Bull.** There's exactly one background job — flip `isOverdue` to true on tasks past their due date — running once a minute. That doesn't need retries, doesn't need a queue, and doesn't need Redis as a dependency. Bull earns its place when you've got several job types or need jobs to survive a restart; neither is true here, so it felt like the wrong tool for a single `UPDATE ... WHERE dueDate < now()`.
+
+**Refresh token in a cookie, access token in memory.** The access token lives only in a JS variable — never localStorage — so an XSS bug can't just read it out of storage. It gets fetched again from `/api/auth/refresh` on page load and whenever a request comes back 401. The refresh token sits in an HttpOnly, SameSite=Lax cookie scoped to `/api/auth`, and gets rotated every time it's used (old one deleted, new one issued), so replaying an old refresh token just fails.
+
+**Roles are checked on the server, full stop.** Every route goes through `requireAuth` and `requireRole`, and the list/detail endpoints also filter by `managerId` or `assigneeId` directly in the Prisma query — not after fetching everything and filtering in JS. A developer's token, no matter how it's used, can't pull back another developer's task or another PM's project.
+
+**The real-time feed follows the same rules as the REST API.** When a socket connects it joins `user:{id}`, and admins additionally join `role:admin`. Opening a project page joins `project:{id}` for as long as you're looking at it. Every activity event gets emitted to exactly the rooms that should see it — the project room, the admin room, the owning PM's room, and the assignee's room if there is one. If you were offline and come back, the client just calls `GET /api/activity` (role-scoped, last 20, read straight from Postgres) to catch up — there's no separate in-memory cache that could get out of sync with what you're actually allowed to see.
+
+## What's not here
+
+- No password reset or email flow — users only come from the seed script for now.
+- Lists are capped rather than properly paginated. Fine for an agency-sized dataset, would need cursor pagination if this ever had thousands of tasks.
+- The overdue check runs every minute in the same process as the API server. If the server's down, overdue flags just catch up on the next tick once it's back — nothing time-critical depends on the exact minute.
+- No attachments on tasks.
+- One Postgres instance, no replica. Not something this scale needs.

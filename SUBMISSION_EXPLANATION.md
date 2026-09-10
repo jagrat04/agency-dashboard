@@ -1,0 +1,7 @@
+Honestly the hardest part wasn't the websocket setup, it was making sure the real-time feed enforced the exact same permissions as the REST API without writing the role logic twice. It's easy to lock down HTTP routes and then forget a socket connection is a second door into the same data — if that door isn't scoped the same way, a developer could watch the live feed and see things they shouldn't, even with every REST endpoint locked down properly.
+
+I solved it with rooms: on connect, every socket joins `user:{id}`, admins also join `role:admin`, and opening a project page joins `project:{id}` for as long as you're on it. When something happens (task moved, reassigned, whatever), one function fans that event out to exactly the rooms that should get it — project, admin, the owning PM, and the assignee if there is one. So the logic isn't duplicated, it's just applied at emit time using the same ownership checks (manager, assignee) the REST routes already use.
+
+For catching up after being offline, I reused that same role-scoped filter as a normal DB query instead of a live push, so a reconnecting client can't see anything through the "backfill" path it couldn't see live.
+
+One thing I'd do differently: a 403 right now just disappears, no record of it. For an internal tool that's the kind of thing that should probably get logged somewhere, if only to debug why someone can't see a project they think they should.
